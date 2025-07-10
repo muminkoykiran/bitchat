@@ -74,16 +74,105 @@ class BatteryOptimizer {
     @Published var isInBackground: Bool = false
     @Published var batteryLevel: Float = 1.0
     @Published var isCharging: Bool = false
+    @Published var thermalState: ThermalState = .nominal
     
     private var observers: [NSObjectProtocol] = []
+    private let modeChangeCooldown: TimeInterval = 30.0 // Prevent rapid mode switching
+    private var lastModeChange: Date = Date.distantPast
+    private var powerModeHistory: [(PowerMode, Date)] = []
+    private let maxHistorySize = 10
+    
+    // Performance monitoring
+    private var networkActivityLevel: NetworkActivity = .low
+    private var cpuUsage: Double = 0.0
+    private var lastThermalCheck: Date = Date.distantPast
+    private let thermalCheckInterval: TimeInterval = 60.0
+    
+    enum ThermalState {
+        case nominal, fair, serious, critical
+        
+        var powerModeMultiplier: Double {
+            switch self {
+            case .nominal: return 1.0
+            case .fair: return 0.8
+            case .serious: return 0.6
+            case .critical: return 0.3
+            }
+        }
+    }
+    
+    enum NetworkActivity {
+        case low, moderate, high, veryHigh
+        
+        var powerModeAdjustment: PowerMode {
+            switch self {
+            case .low: return .powerSaver
+            case .moderate: return .balanced
+            case .high: return .balanced
+            case .veryHigh: return .performance
+            }
+        }
+    }
     
     private init() {
         setupObservers()
         updateBatteryStatus()
+        updateThermalState()
     }
     
     deinit {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+    
+    // MARK: - Public API
+    
+    func updateNetworkActivity(_ activity: NetworkActivity) {
+        guard networkActivityLevel != activity else { return }
+        networkActivityLevel = activity
+        updatePowerMode()
+    }
+    
+    func reportCPUUsage(_ usage: Double) {
+        cpuUsage = max(0.0, min(1.0, usage))
+        if usage > 0.8 {
+            // High CPU usage detected, consider power saving
+            updatePowerMode()
+        }
+    }
+    
+    func getOptimalScanParameters() -> (duration: TimeInterval, pause: TimeInterval) {
+        let mode = getEffectivePowerMode()
+        let thermalMultiplier = thermalState.powerModeMultiplier
+        
+        return (
+            duration: mode.scanDuration * thermalMultiplier,
+            pause: mode.scanPauseDuration / thermalMultiplier
+        )
+    }
+    
+    func getEffectivePowerMode() -> PowerMode {
+        // Apply thermal throttling
+        switch thermalState {
+        case .critical:
+            return .ultraLowPower
+        case .serious:
+            return .powerSaver
+        case .fair:
+            // Downgrade by one level
+            switch currentPowerMode {
+            case .performance: return .balanced
+            case .balanced: return .powerSaver
+            case .powerSaver, .ultraLowPower: return currentPowerMode
+            }
+        case .nominal:
+            return currentPowerMode
+        }
+    }
+    
+    var shouldThrottle: Bool {
+        return thermalState == .serious || thermalState == .critical ||
+               (batteryLevel < 0.15 && !isCharging) ||
+               cpuUsage > 0.9
     }
     
     private func setupObservers() {

@@ -21,8 +21,8 @@ class ChatViewModel: ObservableObject {
     @Published var nickname: String = "" {
         didSet {
             nicknameSaveTimer?.invalidate()
-            nicknameSaveTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { _ in
-                self.saveNickname()
+            nicknameSaveTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+                self?.saveNickname()
             }
         }
     }
@@ -68,10 +68,21 @@ class ChatViewModel: ObservableObject {
     private var peerIDToPublicKeyFingerprint: [String: String] = [:]  // Maps ephemeral peer IDs to persistent fingerprints
     private var blockedUsers: Set<String> = []  // Stores public key fingerprints of blocked users
     
+    // Performance optimization properties
+    private let maxMessagesPerChannel = 500 // Limit messages in memory per channel
+    private let maxPrivateMessages = 200 // Limit private messages in memory per peer
+    private let messageCleanupInterval: TimeInterval = 300 // 5 minutes
+    private var messageCleanupTimer: Timer?
+    
+    // Thread safety
+    private let messageQueue = DispatchQueue(label: "chat.bitchat.messages", attributes: .concurrent)
+    private let channelQueue = DispatchQueue(label: "chat.bitchat.channels", attributes: .concurrent)
+    
     // Messages are naturally ephemeral - no persistent storage
     
     // Delivery tracking
     private var deliveryTrackerCancellable: AnyCancellable?
+    private var cancellables = Set<AnyCancellable>()
     
     init() {
         loadNickname()
@@ -98,6 +109,59 @@ class ChatViewModel: ObservableObject {
         deliveryTrackerCancellable = DeliveryTracker.shared.deliveryStatusUpdated
             .receive(on: DispatchQueue.main)
             .sink { [weak self] (messageID, status) in
+                self?.updateMessageDeliveryStatus(messageID: messageID, status: status)
+            }
+            .store(in: &cancellables)
+        
+        // Start periodic message cleanup
+        startMessageCleanupTimer()
+    }
+    
+    deinit {
+        // Clean up timers and subscriptions
+        nicknameSaveTimer?.invalidate()
+        messageCleanupTimer?.invalidate()
+        deliveryTrackerCancellable?.cancel()
+        cancellables.removeAll()
+    }
+    
+    // MARK: - Memory Management
+    
+    private func startMessageCleanupTimer() {
+        messageCleanupTimer = Timer.scheduledTimer(withTimeInterval: messageCleanupInterval, repeats: true) { [weak self] _ in
+            self?.cleanupOldMessages()
+        }
+    }
+    
+    private func cleanupOldMessages() {
+        messageQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self else { return }
+            
+            DispatchQueue.main.async {
+                // Clean up channel messages
+                for (channel, messages) in self.channelMessages {
+                    if messages.count > self.maxMessagesPerChannel {
+                        let sortedMessages = messages.sorted { $0.timestamp > $1.timestamp }
+                        self.channelMessages[channel] = Array(sortedMessages.prefix(self.maxMessagesPerChannel))
+                    }
+                }
+                
+                // Clean up private messages
+                for (peerID, messages) in self.privateChats {
+                    if messages.count > self.maxPrivateMessages {
+                        let sortedMessages = messages.sorted { $0.timestamp > $1.timestamp }
+                        self.privateChats[peerID] = Array(sortedMessages.prefix(self.maxPrivateMessages))
+                    }
+                }
+                
+                // Clean up main messages (general channel)
+                if self.messages.count > self.maxMessagesPerChannel {
+                    let sortedMessages = self.messages.sorted { $0.timestamp > $1.timestamp }
+                    self.messages = Array(sortedMessages.prefix(self.maxMessagesPerChannel))
+                }
+            }
+        }
+    }
                 self?.updateMessageDeliveryStatus(messageID, status: status)
             }
         
