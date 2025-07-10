@@ -11,15 +11,86 @@ import XCTest
 
 class MessagePaddingTests: XCTestCase {
     
+//
+// MessagePaddingTests.swift
+// bitchatTests
+//
+// This is free and unencumbered software released into the public domain.
+// For more information, see <https://unlicense.org>
+//
+
+import XCTest
+@testable import bitchat
+
+class MessagePaddingTests: XCTestCase {
+    
     func testBasicPadding() {
         let originalData = Data("Hello".utf8)
         let targetSize = 256
         
-        let padded = MessagePadding.pad(originalData, toSize: targetSize)
-        XCTAssertEqual(padded.count, targetSize)
+        let paddingResult = MessagePadding.pad(originalData, toSize: targetSize)
         
-        let unpadded = MessagePadding.unpad(padded)
-        XCTAssertEqual(unpadded, originalData)
+        switch paddingResult {
+        case .success(let padded):
+            XCTAssertEqual(padded.count, targetSize)
+            
+            let unpaddingResult = MessagePadding.unpad(padded)
+            switch unpaddingResult {
+            case .success(let unpadded):
+                XCTAssertEqual(unpadded, originalData)
+            case .failure(let error):
+                XCTFail("Unpadding failed: \(error)")
+            }
+        case .failure(let error):
+            XCTFail("Padding failed: \(error)")
+        }
+    }
+    
+    func testEmptyDataHandling() {
+        let emptyData = Data()
+        
+        let paddingResult = MessagePadding.pad(emptyData, toSize: 256)
+        switch paddingResult {
+        case .success:
+            XCTFail("Should not succeed with empty data")
+        case .failure(let error):
+            XCTAssertEqual(error as? PaddingError, .emptyData)
+        }
+        
+        let unpaddingResult = MessagePadding.unpad(emptyData)
+        switch unpaddingResult {
+        case .success:
+            XCTFail("Should not succeed with empty data")
+        case .failure(let error):
+            XCTAssertEqual(error as? PaddingError, .emptyData)
+        }
+    }
+    
+    func testInvalidPaddingSizes() {
+        let testData = Data("Test".utf8)
+        
+        // Test negative padding (data larger than target)
+        let paddingResult = MessagePadding.pad(testData, toSize: 2)
+        switch paddingResult {
+        case .success(let result):
+            // Should return original data when no padding needed
+            XCTAssertEqual(result, testData)
+        case .failure:
+            XCTFail("Should succeed when data is larger than target")
+        }
+        
+        // Test excessive padding
+        let largePaddingResult = MessagePadding.pad(testData, toSize: 10000)
+        switch largePaddingResult {
+        case .success:
+            break // This should succeed
+        case .failure(let error):
+            if case .invalidPaddingSize(let requested) = error {
+                XCTAssertGreaterThan(requested, 4096)
+            } else {
+                XCTFail("Unexpected error: \(error)")
+            }
+        }
     }
     
     func testMultipleBlockSizes() {
