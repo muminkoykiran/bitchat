@@ -12,18 +12,22 @@ import Combine
 class DeliveryTracker {
     static let shared = DeliveryTracker()
     
+    // Thread-safe access with concurrent queue
+    private let deliveryQueue = DispatchQueue(label: "delivery.tracker.queue", qos: .userInitiated, attributes: .concurrent)
+    private let ackQueue = DispatchQueue(label: "delivery.ack.queue", qos: .userInitiated)
+    
     // Track pending deliveries
-    private var pendingDeliveries: [String: PendingDelivery] = [:]
-    private let pendingLock = NSLock()
+    private var _pendingDeliveries: [String: PendingDelivery] = [:]
     
-    // Track received ACKs to prevent duplicates
-    private var receivedAckIDs = Set<String>()
-    private var sentAckIDs = Set<String>()
+    // Track received ACKs to prevent duplicates (with size limits)
+    private var _receivedAckIDs = Set<String>()
+    private var _sentAckIDs = Set<String>()
+    private let maxAckHistorySize = 1000
     
-    // Timeout configuration
-    private let privateMessageTimeout: TimeInterval = 30  // 30 seconds
-    private let roomMessageTimeout: TimeInterval = 60     // 1 minute
-    private let favoriteTimeout: TimeInterval = 300       // 5 minutes for favorites
+    // Timeout configuration - configurable based on network conditions
+    private var _privateMessageTimeout: TimeInterval = 30  // 30 seconds
+    private var _roomMessageTimeout: TimeInterval = 60     // 1 minute  
+    private var _favoriteTimeout: TimeInterval = 300       // 5 minutes for favorites
     
     // Retry configuration
     private let maxRetries = 3
@@ -32,8 +36,11 @@ class DeliveryTracker {
     // Publishers for UI updates
     let deliveryStatusUpdated = PassthroughSubject<(messageID: String, status: DeliveryStatus), Never>()
     
-    // Cleanup timer
+    // Cleanup timer and performance monitoring
     private var cleanupTimer: Timer?
+    private var lastCleanupTime: Date = Date()
+    private var trackedMessageCount: Int = 0
+    private var ackProcessedCount: Int = 0
     
     struct PendingDelivery {
         let messageID: String
@@ -46,6 +53,18 @@ class DeliveryTracker {
         var ackedBy: Set<String> = []  // For tracking partial channel delivery
         let expectedRecipients: Int  // For channel messages
         var timeoutTimer: Timer?
+        let priority: MessagePriority
+        
+        enum MessagePriority: Int, Comparable {
+            case low = 1
+            case normal = 2
+            case high = 3
+            case critical = 4
+            
+            static func < (lhs: MessagePriority, rhs: MessagePriority) -> Bool {
+                return lhs.rawValue < rhs.rawValue
+            }
+        }
         
         var isTimedOut: Bool {
             let timeout: TimeInterval = isFavorite ? 300 : (isChannelMessage ? 60 : 30)
@@ -55,47 +74,105 @@ class DeliveryTracker {
         var shouldRetry: Bool {
             return retryCount < 3 && isFavorite && !isChannelMessage
         }
+        
+        var isFullyDelivered: Bool {
+            return ackedBy.count >= expectedRecipients
+        }
     }
     
     private init() {
         startCleanupTimer()
+        setupMemoryWarningObserver()
     }
     
     deinit {
         cleanupTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
+    }
+    
+    private func setupMemoryWarningObserver() {
+        #if os(iOS)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMemoryWarning),
+            name: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil
+        )
+        #endif
+    }
+    
+    @objc private func handleMemoryWarning() {
+        deliveryQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self else { return }
+            
+            // Remove low priority messages when memory is low
+            self._pendingDeliveries = self._pendingDeliveries.filter { (_, delivery) in
+                delivery.priority != .low
+            }
+            
+            // Trim ACK history
+            if self._receivedAckIDs.count > self.maxAckHistorySize / 2 {
+                self._receivedAckIDs.removeAll()
+            }
+            if self._sentAckIDs.count > self.maxAckHistorySize / 2 {
+                self._sentAckIDs.removeAll()
+            }
+        }
+    }
+    
+    
+    // MARK: - Configuration
+    
+    func updateTimeouts(private: TimeInterval, room: TimeInterval, favorite: TimeInterval) {
+        deliveryQueue.async(flags: .barrier) { [weak self] in
+            self?._privateMessageTimeout = private
+            self?._roomMessageTimeout = room
+            self?._favoriteTimeout = favorite
+        }
+    }
+    
+    func getTimeouts() -> (private: TimeInterval, room: TimeInterval, favorite: TimeInterval) {
+        return deliveryQueue.sync {
+            return (_privateMessageTimeout, _roomMessageTimeout, _favoriteTimeout)
+        }
     }
     
     // MARK: - Public Methods
     
-    func trackMessage(_ message: BitchatMessage, recipientID: String, recipientNickname: String, isFavorite: Bool = false, expectedRecipients: Int = 1) {
+    func trackMessage(_ message: BitchatMessage, recipientID: String, recipientNickname: String, isFavorite: Bool = false, expectedRecipients: Int = 1, priority: PendingDelivery.MessagePriority = .normal) {
         // Don't track broadcasts or certain message types
         guard message.isPrivate || message.channel != nil else { return }
         
-        
-        let delivery = PendingDelivery(
-            messageID: message.id,
-            sentAt: Date(),
-            recipientID: recipientID,
-            recipientNickname: recipientNickname,
-            retryCount: 0,
-            isChannelMessage: message.channel != nil,
-            isFavorite: isFavorite,
-            expectedRecipients: expectedRecipients,
-            timeoutTimer: nil
-        )
-        
-        // Store the delivery with lock
-        pendingLock.lock()
-        pendingDeliveries[message.id] = delivery
-        pendingLock.unlock()
-        
-        // Update status to sent
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.updateDeliveryStatus(message.id, status: .sent)
+        deliveryQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self else { return }
+            
+            let delivery = PendingDelivery(
+                messageID: message.id,
+                sentAt: Date(),
+                recipientID: recipientID,
+                recipientNickname: recipientNickname,
+                retryCount: 0,
+                isChannelMessage: message.channel != nil,
+                isFavorite: isFavorite,
+                expectedRecipients: expectedRecipients,
+                timeoutTimer: nil,
+                priority: priority
+            )
+            
+            // Store the delivery
+            self._pendingDeliveries[message.id] = delivery
+            self.trackedMessageCount += 1
+            
+            // Update status to sent
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.updateDeliveryStatus(message.id, status: .sent)
+            }
+            
+            // Schedule timeout (outside of queue to avoid deadlock)
+            DispatchQueue.main.async {
+                self.scheduleTimeout(for: message.id)
+            }
         }
-        
-        // Schedule timeout (outside of lock)
-        scheduleTimeout(for: message.id)
     }
     
     func processDeliveryAck(_ ack: DeliveryAck) {
