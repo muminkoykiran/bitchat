@@ -23,6 +23,9 @@ This project is released into the public domain. See the [LICENSE](LICENSE) file
 - **Cover Traffic**: Timing obfuscation and dummy messages for enhanced privacy
 - **Emergency Wipe**: Triple-tap to instantly clear all data
 - **Performance Optimizations**: LZ4 message compression, adaptive battery modes, and optimized networking
+- ✅ **Enhanced Security**: Automatic key rotation every 30 minutes for perfect forward secrecy
+- ✅ **Thermal Management**: Advanced thermal monitoring and adaptive performance throttling
+- ✅ **Smart Monitoring**: Bloom filter performance tracking with automatic optimization
 
 ## Setup
 
@@ -106,6 +109,7 @@ This project is released into the public domain. See the [LICENSE](LICENSE) file
 - **Cover Traffic**: Random delays and dummy messages prevent traffic analysis
 - **Emergency Wipe**: Triple-tap logo to instantly clear all data
 - **Local-First**: Works completely offline, no servers involved
+- ✅ **Enhanced Forward Secrecy**: Automatic ephemeral key rotation for maximum security
 
 ## Performance & Efficiency
 
@@ -122,11 +126,14 @@ This project is released into the public domain. See the [LICENSE](LICENSE) file
   - Ultra-low power: Emergency mode when <10% battery
 - **Background efficiency**: Automatic power saving when app backgrounded
 - **Configurable scanning**: Duty cycle adapts to battery state
+- ✅ **Thermal Intelligence**: Smart thermal monitoring prevents overheating and performance degradation
 
 ### Network Efficiency
 - **Optimized Bloom filters**: Faster duplicate detection with less memory
 - **Message aggregation**: Batches small messages to reduce transmissions
 - **Adaptive connection limits**: Adjusts peer connections based on power mode
+- ✅ **Smart Storage Management**: Thread-safe message retention with automatic cleanup
+- ✅ **Performance Monitoring**: Real-time Bloom filter efficiency tracking and auto-optimization
 
 ## Technical Architecture
 
