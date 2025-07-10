@@ -35,9 +35,12 @@ class BluetoothMeshService: NSObject {
     private var peripheralManager: CBPeripheralManager?
     private var discoveredPeripherals: [CBPeripheral] = []
     private var connectedPeripherals: [String: CBPeripheral] = [:]
+    private let connectedPeripheralsLock = NSLock()  // Thread safety for connectedPeripherals
     private var peripheralCharacteristics: [CBPeripheral: CBCharacteristic] = [:]
+    private let peripheralCharacteristicsLock = NSLock()  // Thread safety for characteristics
     private var characteristic: CBMutableCharacteristic?
     private var subscribedCentrals: [CBCentral] = []
+    private let subscribedCentralsLock = NSLock()  // Thread safety for centrals
     private var peerNicknames: [String: String] = [:]
     private let peerNicknamesLock = NSLock()
     private var activePeers: Set<String> = []  // Track all active peers
@@ -305,14 +308,43 @@ class BluetoothMeshService: NSObject {
         #endif
     }
     
+    // MARK: - Deinitialization
     deinit {
-        cleanup()
-        scanDutyCycleTimer?.invalidate()
-        batteryMonitorTimer?.invalidate()
-        coverTrafficTimer?.invalidate()
-        bloomFilterResetTimer?.invalidate()
+        // Stop all timers to prevent memory leaks
         aggregationTimer?.invalidate()
+        aggregationTimer = nil
+        
+        bloomFilterResetTimer?.invalidate()
+        bloomFilterResetTimer = nil
+        
         cleanupTimer?.invalidate()
+        cleanupTimer = nil
+        
+        peerListUpdateTimer?.invalidate()
+        peerListUpdateTimer = nil
+        
+        advertisingTimer?.invalidate()
+        advertisingTimer = nil
+        
+        scanDutyCycleTimer?.invalidate()
+        scanDutyCycleTimer = nil
+        
+        batteryMonitorTimer?.invalidate()
+        batteryMonitorTimer = nil
+        
+        coverTrafficTimer?.invalidate()
+        coverTrafficTimer = nil
+        
+        nicknameSaveTimer?.invalidate()
+        nicknameSaveTimer = nil
+        
+        // Cancel all Combine subscriptions
+        batteryOptimizerCancellables.removeAll()
+        
+        // Stop services properly
+        stopServices()
+        
+        print("[BLUETOOTH] BluetoothMeshService deinitialized with proper cleanup")
     }
     
     @objc private func appWillTerminate() {
@@ -496,6 +528,38 @@ class BluetoothMeshService: NSObject {
     }
     
     func sendMessage(_ content: String, mentions: [String] = [], channel: String? = nil, to recipientID: String? = nil, messageID: String? = nil, timestamp: Date? = nil) {
+        // Enhanced input validation
+        guard !content.isEmpty else {
+            print("[ERROR] Cannot send empty message")
+            return
+        }
+        
+        // Validate content length (prevent oversized messages)
+        guard content.utf8.count <= 10000 else {
+            print("[ERROR] Message too large: \(content.utf8.count) bytes")
+            return
+        }
+        
+        // Validate mentions format
+        let validMentions = mentions.filter { mention in
+            !mention.isEmpty && mention.count <= 50 && mention.allSatisfy { $0.isASCII }
+        }
+        
+        // Validate channel format if provided
+        if let channel = channel {
+            guard channel.hasPrefix("#") && channel.count > 1 && channel.count <= 50 else {
+                print("[ERROR] Invalid channel format: \(channel)")
+                return
+            }
+        }
+        
+        // Validate recipientID format if provided
+        if let recipientID = recipientID {
+            guard !recipientID.isEmpty && recipientID.count <= 50 else {
+                print("[ERROR] Invalid recipient ID format")
+                return
+            }
+        }
         // Defensive check for empty content
         guard !content.isEmpty else { return }
         messageQueue.async { [weak self] in
@@ -1218,7 +1282,7 @@ class BluetoothMeshService: NSObject {
             
             // Mark messages as delivered immediately to prevent duplicates
             let messageIDsToRemove = messagesToSend.map { $0.messageID }
-            self.deliveredMessages.formUnion(messageIDsToRemove)
+            self.deliveredMessages.formUnion(messageIDsToSend)
             
             // Send cached messages with slight delay between each
             for (index, storedMessage) in messagesToSend.enumerated() {
@@ -1964,6 +2028,7 @@ class BluetoothMeshService: NSObject {
             handleFragment(packet, from: peerID)
             
             // Relay fragments if TTL > 0
+           
             var relayPacket = packet
             relayPacket.ttl -= 1
             if relayPacket.ttl > 0 {

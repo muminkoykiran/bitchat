@@ -18,7 +18,7 @@ class EncryptionService {
     private var signingPrivateKey: Curve25519.Signing.PrivateKey
     public let signingPublicKey: Curve25519.Signing.PublicKey
     
-    // Storage for peer keys
+    // Storage for peer keys - protected by concurrent queue with barriers
     private var peerPublicKeys: [String: Curve25519.KeyAgreement.PublicKey] = [:]
     private var peerSigningKeys: [String: Curve25519.Signing.PublicKey] = [:]
     private var peerIdentityKeys: [String: Curve25519.Signing.PublicKey] = [:]
@@ -31,7 +31,15 @@ class EncryptionService {
     // Thread safety
     private let cryptoQueue = DispatchQueue(label: "chat.bitchat.crypto", attributes: .concurrent)
     
+    // Key rotation parameters
+    private let keyRotationInterval: TimeInterval = 24 * 60 * 60 // 24 hours
+    private var lastKeyRotation: Date
+    private var keyGenerationCounter: UInt64 = 0
+    
     init() {
+        // Initialize key rotation timestamp
+        self.lastKeyRotation = Date()
+        
         // Generate ephemeral key pairs for this session
         self.privateKey = Curve25519.KeyAgreement.PrivateKey()
         self.publicKey = privateKey.publicKey
@@ -39,16 +47,62 @@ class EncryptionService {
         self.signingPrivateKey = Curve25519.Signing.PrivateKey()
         self.signingPublicKey = signingPrivateKey.publicKey
         
-        // Load or create persistent identity key
-        if let identityData = UserDefaults.standard.data(forKey: "bitchat.identityKey"),
+        // Load or create persistent identity key from secure keychain
+        if let identityData = KeychainManager.shared.retrieveData(key: "bitchat.identityKey"),
            let loadedKey = try? Curve25519.Signing.PrivateKey(rawRepresentation: identityData) {
             self.identityKey = loadedKey
         } else {
-            // First run - create and save identity key
+            // First run - create and save identity key to keychain
             self.identityKey = Curve25519.Signing.PrivateKey()
-            UserDefaults.standard.set(identityKey.rawRepresentation, forKey: "bitchat.identityKey")
+            let _ = KeychainManager.shared.storeData(identityKey.rawRepresentation, key: "bitchat.identityKey")
         }
         self.identityPublicKey = identityKey.publicKey
+        
+        // Increment key generation counter
+        self.keyGenerationCounter += 1
+    }
+    
+    deinit {
+        // Clear sensitive data from memory
+        clearEphemeralKeys()
+    }
+    
+    // MARK: - Key Management
+    
+    /// Rotates ephemeral keys for forward secrecy
+    func rotateEphemeralKeys() {
+        cryptoQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self else { return }
+            
+            // Generate new ephemeral key pairs
+            self.privateKey = Curve25519.KeyAgreement.PrivateKey()
+            self.signingPrivateKey = Curve25519.Signing.PrivateKey()
+            
+            // Clear old shared secrets to force renegotiation
+            self.sharedSecrets.removeAll()
+            
+            // Update timestamp and counter
+            self.lastKeyRotation = Date()
+            self.keyGenerationCounter += 1
+        }
+    }
+    
+    /// Checks if key rotation is needed and performs it
+    func checkAndRotateKeys() {
+        if Date().timeIntervalSince(lastKeyRotation) > keyRotationInterval {
+            rotateEphemeralKeys()
+        }
+    }
+    
+    /// Clears ephemeral cryptographic material from memory
+    private func clearEphemeralKeys() {
+        cryptoQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self else { return }
+            self.sharedSecrets.removeAll()
+            self.peerPublicKeys.removeAll()
+            self.peerSigningKeys.removeAll()
+            // Note: Identity keys are persistent and not cleared
+        }
     }
     
     // Create combined public key data for exchange
@@ -60,44 +114,52 @@ class EncryptionService {
         return data  // Total: 96 bytes
     }
     
-    // Add peer's combined public keys
+    // Add peer's combined public keys with enhanced validation
     func addPeerPublicKey(_ peerID: String, publicKeyData: Data) throws {
+        // Validate peer ID
+        guard !peerID.isEmpty && peerID.count <= 64 else {
+            throw EncryptionError.invalidPeerID
+        }
+        
         try cryptoQueue.sync(flags: .barrier) {
             // Convert to array for safe access
             let keyBytes = [UInt8](publicKeyData)
             
             guard keyBytes.count == 96 else {
-                // print("[CRYPTO] Invalid public key data size: \(keyBytes.count), expected 96")
                 throw EncryptionError.invalidPublicKey
             }
             
-            // Extract all three keys: 32 for key agreement + 32 for signing + 32 for identity
+            // Validate key data is not all zeros (weak key detection)
+            let zeroKey = Data(repeating: 0, count: 32)
             let keyAgreementData = Data(keyBytes[0..<32])
             let signingKeyData = Data(keyBytes[32..<64])
             let identityKeyData = Data(keyBytes[64..<96])
             
+            guard keyAgreementData != zeroKey && 
+                  signingKeyData != zeroKey && 
+                  identityKeyData != zeroKey else {
+                throw EncryptionError.weakKey
+            }
+            
+            // Extract and validate all three keys
             let publicKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: keyAgreementData)
-            peerPublicKeys[peerID] = publicKey
-            
             let signingKey = try Curve25519.Signing.PublicKey(rawRepresentation: signingKeyData)
-            peerSigningKeys[peerID] = signingKey
-            
             let identityKey = try Curve25519.Signing.PublicKey(rawRepresentation: identityKeyData)
+            
+            // Store keys
+            peerPublicKeys[peerID] = publicKey
+            peerSigningKeys[peerID] = signingKey
             peerIdentityKeys[peerID] = identityKey
             
-            // Stored all three keys for peer
-            
-            // Generate shared secret for encryption
-            if let publicKey = peerPublicKeys[peerID] {
-                let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: publicKey)
-                let symmetricKey = sharedSecret.hkdfDerivedSymmetricKey(
-                    using: SHA256.self,
-                    salt: "bitchat-v1".data(using: .utf8)!,
-                    sharedInfo: Data(),
-                    outputByteCount: 32
-                )
-                sharedSecrets[peerID] = symmetricKey
-            }
+            // Generate shared secret for encryption with enhanced HKDF
+            let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: publicKey)
+            let symmetricKey = sharedSecret.hkdfDerivedSymmetricKey(
+                using: SHA256.self,
+                salt: Data("bitchat-v1-salt".utf8),
+                sharedInfo: Data("\(keyGenerationCounter)".utf8), // Include generation counter
+                outputByteCount: 32
+            )
+            sharedSecrets[peerID] = symmetricKey
         }
     }
     
@@ -110,11 +172,17 @@ class EncryptionService {
     
     // Clear persistent identity (for panic mode)
     func clearPersistentIdentity() {
-        UserDefaults.standard.removeObject(forKey: "bitchat.identityKey")
-        // print("[CRYPTO] Cleared persistent identity key")
+        let _ = KeychainManager.shared.deleteData(key: "bitchat.identityKey")
     }
     
+    // MARK: - Encryption/Decryption
+    
     func encrypt(_ data: Data, for peerID: String) throws -> Data {
+        // Validate input
+        guard !data.isEmpty && data.count <= 1024 * 1024 else { // 1MB limit
+            throw EncryptionError.invalidDataSize
+        }
+        
         let symmetricKey = try cryptoQueue.sync {
             guard let key = sharedSecrets[peerID] else {
                 throw EncryptionError.noSharedSecret
@@ -123,10 +191,18 @@ class EncryptionService {
         }
         
         let sealedBox = try AES.GCM.seal(data, using: symmetricKey)
-        return sealedBox.combined ?? Data()
+        guard let combined = sealedBox.combined else {
+            throw EncryptionError.encryptionFailed
+        }
+        return combined
     }
     
     func decrypt(_ data: Data, from peerID: String) throws -> Data {
+        // Validate input
+        guard !data.isEmpty && data.count >= 28 else { // Minimum size for AES-GCM
+            throw EncryptionError.invalidDataSize
+        }
+        
         let symmetricKey = try cryptoQueue.sync {
             guard let key = sharedSecrets[peerID] else {
                 throw EncryptionError.noSharedSecret
@@ -134,32 +210,78 @@ class EncryptionService {
             return key
         }
         
-        let sealedBox = try AES.GCM.SealedBox(combined: data)
-        return try AES.GCM.open(sealedBox, using: symmetricKey)
+        do {
+            let sealedBox = try AES.GCM.SealedBox(combined: data)
+            return try AES.GCM.open(sealedBox, using: symmetricKey)
+        } catch {
+            throw EncryptionError.decryptionFailed
+        }
     }
     
+    // MARK: - Digital Signatures
+    
     func sign(_ data: Data) throws -> Data {
+        guard !data.isEmpty else {
+            throw EncryptionError.invalidDataSize
+        }
+        
         // Create a local copy of the key to avoid concurrent access
         let key = signingPrivateKey
-        return try key.signature(for: data)
+        do {
+            return try key.signature(for: data)
+        } catch {
+            throw EncryptionError.signingFailed
+        }
     }
     
     func verify(_ signature: Data, for data: Data, from peerID: String) throws -> Bool {
+        guard !data.isEmpty && !signature.isEmpty else {
+            throw EncryptionError.invalidDataSize
+        }
+        
         let verifyingKey = try cryptoQueue.sync {
             guard let key = peerSigningKeys[peerID] else {
-                throw EncryptionError.noSharedSecret
+                throw EncryptionError.noPeerKey
             }
             return key
         }
         
-        return verifyingKey.isValidSignature(signature, for: data)
+        do {
+            return verifyingKey.isValidSignature(signature, for: data)
+        } catch {
+            throw EncryptionError.verificationFailed
+        }
+    }
+    
+    // MARK: - Utility Methods
+    
+    /// Remove a peer's keys (for cleanup)
+    func removePeer(_ peerID: String) {
+        cryptoQueue.async(flags: .barrier) { [weak self] in
+            guard let self = self else { return }
+            self.peerPublicKeys.removeValue(forKey: peerID)
+            self.peerSigningKeys.removeValue(forKey: peerID)
+            self.peerIdentityKeys.removeValue(forKey: peerID)
+            self.sharedSecrets.removeValue(forKey: peerID)
+        }
+    }
+    
+    /// Get current key generation counter for debugging
+    var currentKeyGeneration: UInt64 {
+        return keyGenerationCounter
     }
     
 }
 
 enum EncryptionError: Error {
     case noSharedSecret
+    case noPeerKey
+    case invalidPeerID
     case invalidPublicKey
+    case weakKey
+    case invalidDataSize
     case encryptionFailed
     case decryptionFailed
+    case signingFailed
+    case verificationFailed
 }
