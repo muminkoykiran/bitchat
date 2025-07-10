@@ -274,6 +274,15 @@ class BluetoothMeshService: NSObject {
             self?.messageQueue.async(flags: .barrier) {
                 guard let self = self else { return }
                 
+                // Check if bloom filter needs immediate reset due to saturation
+                if self.messageBloomFilter.needsReset {
+                    print("[BLOOM] Filter saturated, resetting early")
+                }
+                
+                // Log performance metrics before reset
+                let metrics = self.messageBloomFilter.performanceMetrics
+                print("[BLOOM] Performance: insertCount=\(metrics.insertCount), FPR=\(String(format: "%.4f", metrics.estimatedFPR)), saturation=\(String(format: "%.2f", metrics.saturation))")
+                
                 // Adapt Bloom filter size based on network size
                 let networkSize = self.estimatedNetworkSize
                 self.messageBloomFilter = OptimizedBloomFilter.adaptive(for: networkSize)
@@ -281,7 +290,6 @@ class BluetoothMeshService: NSObject {
                 // Clear other duplicate detection sets
                 self.processedMessages.removeAll()
                 self.processedKeyExchanges.removeAll()
-                
             }
         }
         
@@ -306,6 +314,11 @@ class BluetoothMeshService: NSObject {
             object: nil
         )
         #endif
+        
+        // Start periodic key rotation timer (every 30 minutes)
+        Timer.scheduledTimer(withTimeInterval: 1800.0, repeats: true) { [weak self] _ in
+            self?.encryptionService.checkAndRotateKeys()
+        }
     }
     
     // MARK: - Deinitialization
@@ -1486,12 +1499,24 @@ class BluetoothMeshService: NSObject {
         messageBloomFilter.insert(messageID)
         processedMessages.insert(messageID)
         
-        // Log statistics periodically
+        // Log statistics and check saturation periodically
         if messageBloomFilter.insertCount % 100 == 0 {
             let fpRate = messageBloomFilter.estimatedFalsePositiveRate
+            let saturation = messageBloomFilter.saturationLevel
+            
+            // Check if filter needs reset due to high saturation
+            if messageBloomFilter.needsReset {
+                print("[BLOOM] Filter needs reset: FPR=\(String(format: "%.4f", fpRate)), saturation=\(String(format: "%.2f", saturation))")
+                
+                // Reset filter immediately
+                let networkSize = estimatedNetworkSize
+                messageBloomFilter = OptimizedBloomFilter.adaptive(for: networkSize)
+                processedMessages.removeAll()
+                processedKeyExchanges.removeAll()
+            }
         }
         
-        // Reset bloom filter periodically to prevent saturation
+        // Legacy fallback - should not be needed with new saturation monitoring
         if processedMessages.count > 1000 {
             processedMessages.removeAll()
             messageBloomFilter.reset()
@@ -2603,7 +2628,6 @@ extension BluetoothMeshService: CBPeripheralDelegate {
         }
         
         // Use the sender ID from the packet, not our local mapping which might still be a temp ID
-        let _ = connectedPeripherals.first(where: { $0.value == peripheral })?.key ?? "unknown"
         let packetSenderID = String(data: packet.senderID.trimmingNullBytes(), encoding: .utf8) ?? "unknown"
         
         // Always handle received packets
@@ -2819,6 +2843,13 @@ extension BluetoothMeshService: CBPeripheralManagerDelegate {
             }
             .store(in: &batteryOptimizerCancellables)
         
+        // Subscribe to thermal state changes
+        batteryOptimizer.$thermalState
+            .sink { [weak self] thermalState in
+                self?.handleThermalStateChange(thermalState)
+            }
+            .store(in: &batteryOptimizerCancellables)
+        
         // Initial update
         handlePowerModeChange(batteryOptimizer.currentPowerMode)
     }
@@ -2994,5 +3025,52 @@ extension BluetoothMeshService: CBPeripheralManagerDelegate {
     
     private func updatePeerLastSeen(_ peerID: String) {
         peerLastSeenTimestamps[peerID] = Date()
+    }
+    
+    private func handleThermalStateChange(_ thermalState: BatteryOptimizer.ThermalState) {
+        switch thermalState {
+        case .critical:
+            // Emergency throttling - minimal activity
+            activeScanDuration = 0.2
+            scanPauseDuration = 30.0
+            aggregationWindow = 1.0
+            
+            // Disconnect all but essential connections
+            if connectedPeripherals.count > 1 {
+                disconnectLeastImportantPeripherals(keepCount: 1)
+            }
+            
+        case .serious:
+            // Heavy throttling
+            activeScanDuration = 0.5
+            scanPauseDuration = 15.0
+            aggregationWindow = 0.8
+            
+            // Reduce connections
+            if connectedPeripherals.count > 2 {
+                disconnectLeastImportantPeripherals(keepCount: 2)
+            }
+            
+        case .fair:
+            // Moderate throttling
+            activeScanDuration = max(1.0, activeScanDuration * 0.7)
+            scanPauseDuration = min(10.0, scanPauseDuration * 1.5)
+            aggregationWindow = max(0.2, aggregationWindow * 1.2)
+            
+        case .nominal:
+            // Use normal battery optimizer settings
+            let params = batteryOptimizer.getOptimalScanParameters()
+            activeScanDuration = params.duration
+            scanPauseDuration = params.pause
+        }
+        
+        // Report thermal throttling activity to battery optimizer
+        batteryOptimizer.reportCPUUsage(thermalState == .critical ? 0.9 : (thermalState == .serious ? 0.7 : 0.3))
+        
+        // Restart scanning with new parameters if currently scanning
+        if scanDutyCycleTimer != nil {
+            scanDutyCycleTimer?.invalidate()
+            scheduleScanDutyCycle()
+        }
     }
 }
