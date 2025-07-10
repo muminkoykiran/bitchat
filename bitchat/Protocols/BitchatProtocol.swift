@@ -9,47 +9,85 @@
 import Foundation
 import CryptoKit
 
-// Privacy-preserving padding utilities
+// Privacy-preserving padding utilities with enhanced security
 struct MessagePadding {
     // Standard block sizes for padding
-    static let blockSizes = [256, 512, 1024, 2048]
+    static let blockSizes = [256, 512, 1024, 2048, 4096]
     
-    // Add PKCS#7-style padding to reach target size
-    static func pad(_ data: Data, toSize targetSize: Int) -> Data {
-        guard data.count < targetSize else { return data }
+    // Secure random number generator
+    private static let secureRandom = SystemRandomNumberGenerator()
+    
+    // Add cryptographically secure padding to reach target size
+    static func pad(_ data: Data, toSize targetSize: Int) -> Result<Data, PaddingError> {
+        guard !data.isEmpty else {
+            return .failure(.emptyData)
+        }
+        
+        guard data.count < targetSize else {
+            return .success(data) // No padding needed
+        }
         
         let paddingNeeded = targetSize - data.count
         
-        // PKCS#7 only supports padding up to 255 bytes
-        // If we need more padding than that, don't pad - return original data
-        guard paddingNeeded <= 255 else { return data }
+        // Validate padding requirements
+        guard paddingNeeded > 0 && paddingNeeded <= 4096 else {
+            return .failure(.invalidPaddingSize(requested: paddingNeeded))
+        }
         
         var padded = data
         
-        // Standard PKCS#7 padding
-        var randomBytes = [UInt8](repeating: 0, count: paddingNeeded - 1)
-        _ = SecRandomCopyBytes(kSecRandomDefault, paddingNeeded - 1, &randomBytes)
-        padded.append(contentsOf: randomBytes)
+        // Generate cryptographically secure random padding
+        if paddingNeeded > 1 {
+            var randomBytes = Data(count: paddingNeeded - 1)
+            let result = randomBytes.withUnsafeMutableBytes { ptr in
+                SecRandomCopyBytes(kSecRandomDefault, paddingNeeded - 1, ptr.bindMemory(to: UInt8.self).baseAddress!)
+            }
+            
+            guard result == errSecSuccess else {
+                return .failure(.randomGenerationFailed)
+            }
+            
+            padded.append(randomBytes)
+        }
+        
+        // Add padding length as last byte
         padded.append(UInt8(paddingNeeded))
         
-        return padded
+        return .success(padded)
     }
     
-    // Remove padding from data
-    static func unpad(_ data: Data) -> Data {
-        guard !data.isEmpty else { return data }
+    // Remove padding from data with validation
+    static func unpad(_ data: Data) -> Result<Data, PaddingError> {
+        guard !data.isEmpty else {
+            return .failure(.emptyData)
+        }
         
         // Last byte tells us how much padding to remove
         let paddingLength = Int(data[data.count - 1])
-        guard paddingLength > 0 && paddingLength <= data.count else { return data }
         
-        return data.prefix(data.count - paddingLength)
+        // Validate padding length
+        guard paddingLength > 0 && paddingLength <= data.count else {
+            return .failure(.invalidPaddingLength(found: paddingLength, dataSize: data.count))
+        }
+        
+        let unpaddedData = data.prefix(data.count - paddingLength)
+        
+        // Verify we have meaningful data after unpadding
+        guard !unpaddedData.isEmpty else {
+            return .failure(.nothingLeftAfterUnpadding)
+        }
+        
+        return .success(unpaddedData)
     }
     
-    // Find optimal block size for data
-    static func optimalBlockSize(for dataSize: Int) -> Int {
-        // Account for encryption overhead (~16 bytes for AES-GCM tag)
-        let totalSize = dataSize + 16
+    // Find optimal block size for data with security considerations
+    static func optimalBlockSize(for dataSize: Int, securityLevel: SecurityLevel = .standard) -> Int {
+        // Account for encryption overhead (~28 bytes for AES-GCM tag + nonce)
+        let encryptionOverhead = 28
+        let totalSize = dataSize + encryptionOverhead
+        
+        // Apply security level multiplier
+        let blockSizes = getBlockSizes(for: securityLevel)
         
         // Find smallest block that fits
         for blockSize in blockSizes {
@@ -58,13 +96,76 @@ struct MessagePadding {
             }
         }
         
-        // For very large messages, just use the original size
-        // (will be fragmented anyway)
-        return dataSize
+        // For very large messages, round up to nearest power of 2
+        var nextPowerOf2 = 1
+        while nextPowerOf2 < totalSize {
+            nextPowerOf2 *= 2
+        }
+        
+        return min(nextPowerOf2, 65536) // Cap at 64KB
+    }
+    
+    private static func getBlockSizes(for securityLevel: SecurityLevel) -> [Int] {
+        switch securityLevel {
+        case .minimal:
+            return [256, 512, 1024]
+        case .standard:
+            return blockSizes
+        case .enhanced:
+            return [512, 1024, 2048, 4096, 8192]
+        case .maximum:
+            return [1024, 2048, 4096, 8192, 16384]
+        }
     }
 }
 
-enum MessageType: UInt8 {
+// MARK: - Error Types
+
+enum PaddingError: Error, LocalizedError {
+    case emptyData
+    case invalidPaddingSize(requested: Int)
+    case randomGenerationFailed
+    case invalidPaddingLength(found: Int, dataSize: Int)
+    case nothingLeftAfterUnpadding
+    
+    var errorDescription: String? {
+        switch self {
+        case .emptyData:
+            return "Cannot pad empty data"
+        case .invalidPaddingSize(let requested):
+            return "Invalid padding size requested: \(requested)"
+        case .randomGenerationFailed:
+            return "Failed to generate secure random padding"
+        case .invalidPaddingLength(let found, let dataSize):
+            return "Invalid padding length \(found) for data size \(dataSize)"
+        case .nothingLeftAfterUnpadding:
+            return "No data remaining after removing padding"
+        }
+    }
+}
+
+enum SecurityLevel: Int, CaseIterable {
+    case minimal = 1    // Fastest, least secure
+    case standard = 2   // Balanced
+    case enhanced = 3   // More secure, slower
+    case maximum = 4    // Most secure, slowest
+    
+    var description: String {
+        switch self {
+        case .minimal:
+            return "Minimal Security"
+        case .standard:
+            return "Standard Security"
+        case .enhanced:
+            return "Enhanced Security"
+        case .maximum:
+            return "Maximum Security"
+        }
+    }
+}
+}
+
+enum MessageType: UInt8, CaseIterable {
     case announce = 0x01
     case keyExchange = 0x02
     case leave = 0x03
@@ -77,6 +178,47 @@ enum MessageType: UInt8 {
     case deliveryAck = 0x0A  // Acknowledge message received
     case deliveryStatusRequest = 0x0B  // Request delivery status update
     case readReceipt = 0x0C  // Message has been read/viewed
+    case heartbeat = 0x0D    // Keep-alive message
+    case peerInfo = 0x0E     // Peer capability information
+    case error = 0xFF        // Error message
+    
+    var description: String {
+        switch self {
+        case .announce: return "Announce"
+        case .keyExchange: return "Key Exchange"
+        case .leave: return "Leave"
+        case .message: return "Message"
+        case .fragmentStart: return "Fragment Start"
+        case .fragmentContinue: return "Fragment Continue"
+        case .fragmentEnd: return "Fragment End"
+        case .channelAnnounce: return "Channel Announce"
+        case .channelRetention: return "Channel Retention"
+        case .deliveryAck: return "Delivery ACK"
+        case .deliveryStatusRequest: return "Delivery Status Request"
+        case .readReceipt: return "Read Receipt"
+        case .heartbeat: return "Heartbeat"
+        case .peerInfo: return "Peer Info"
+        case .error: return "Error"
+        }
+    }
+    
+    var requiresEncryption: Bool {
+        switch self {
+        case .message, .deliveryAck, .readReceipt:
+            return true
+        default:
+            return false
+        }
+    }
+    
+    var requiresSignature: Bool {
+        switch self {
+        case .keyExchange, .channelAnnounce, .announce:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 // Special recipient ID for broadcast messages
