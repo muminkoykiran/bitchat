@@ -122,7 +122,7 @@ class KeychainManager {
         return String(data: data, encoding: .utf8)
     }
     
-    private func retrieveData(forKey key: String) -> Data? {
+    func retrieveData(forKey key: String) -> Data? {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -158,6 +158,37 @@ class KeychainManager {
         
         let status = SecItemDelete(query as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
+    }
+    
+    func storeData(_ data: Data, forKey key: String) -> Bool {
+        // First try to update existing item
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key
+        ]
+        
+        if let accessGroup = accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+        
+        let attributes: [String: Any] = [
+            kSecValueData as String: data
+        ]
+        
+        var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        
+        // If item doesn't exist, create it
+        if status == errSecItemNotFound {
+            query[kSecValueData as String] = data
+            status = SecItemAdd(query as CFDictionary, nil)
+        }
+        
+        return status == errSecSuccess
+    }
+    
+    func deleteData(forKey key: String) -> Bool {
+        return delete(forKey: key)
     }
     
     // MARK: - Cleanup

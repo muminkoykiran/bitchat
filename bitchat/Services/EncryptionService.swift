@@ -48,13 +48,13 @@ class EncryptionService {
         self.signingPublicKey = signingPrivateKey.publicKey
         
         // Load or create persistent identity key from secure keychain
-        if let identityData = KeychainManager.shared.retrieveData(key: "bitchat.identityKey"),
+        if let identityData = KeychainManager.shared.retrieveData(forKey: "bitchat.identityKey"),
            let loadedKey = try? Curve25519.Signing.PrivateKey(rawRepresentation: identityData) {
             self.identityKey = loadedKey
         } else {
             // First run - create and save identity key to keychain
             self.identityKey = Curve25519.Signing.PrivateKey()
-            let _ = KeychainManager.shared.storeData(identityKey.rawRepresentation, key: "bitchat.identityKey")
+            let _ = KeychainManager.shared.storeData(identityKey.rawRepresentation, forKey: "bitchat.identityKey")
         }
         self.identityPublicKey = identityKey.publicKey
         
@@ -172,7 +172,7 @@ class EncryptionService {
     
     // Clear persistent identity (for panic mode)
     func clearPersistentIdentity() {
-        let _ = KeychainManager.shared.deleteData(key: "bitchat.identityKey")
+        let _ = KeychainManager.shared.deleteData(forKey: "bitchat.identityKey")
     }
     
     // MARK: - Encryption/Decryption

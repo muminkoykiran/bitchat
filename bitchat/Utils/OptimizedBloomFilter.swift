@@ -73,7 +73,7 @@ struct OptimizedBloomFilter {
         }
     }
     
-    func contains(_ item: String) -> Bool {
+    mutating func contains(_ item: String) -> Bool {
         // Validate input
         guard !item.isEmpty else { return false }
         
