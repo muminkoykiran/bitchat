@@ -244,21 +244,6 @@ class BatteryOptimizer {
         updatePowerMode()
     }
     
-    private func updateThermalState() {
-        #if os(iOS)
-        if #available(iOS 11.0, *) {
-            thermalState = ProcessInfo.processInfo.thermalState
-        } else {
-            thermalState = .nominal
-        }
-        #else
-        // macOS thermal monitoring
-        thermalState = .nominal
-        #endif
-        
-        updatePowerMode()
-    }
-    
     #if os(macOS)
     private func getMacOSBatteryInfo() -> (level: Float, isCharging: Bool)? {
         let snapshot = IOPSCopyPowerSourcesInfo().takeRetainedValue()
